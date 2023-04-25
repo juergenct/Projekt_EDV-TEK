@@ -1,5 +1,6 @@
 # Code snippets for .gitignore
 Example_Pytorch.py
+Test_TextCategorizer.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
