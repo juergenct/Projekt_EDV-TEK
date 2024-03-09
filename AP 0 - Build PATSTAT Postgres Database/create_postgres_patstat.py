@@ -5,11 +5,11 @@ from tqdm import tqdm
 
 # Connect to Postgres server
 db_params = {
-    'user': 'tie',
-    'password': 'TIE%2023!tuhh',
-    'host': '127.0.0.1',
-    'port': 65432,
-    'database': 'PATSTAT_2023'
+    'user': user,
+    'password': password,
+    'host': host,
+    'port': port,
+    'database': db
     # 'database': db_name
 }
 

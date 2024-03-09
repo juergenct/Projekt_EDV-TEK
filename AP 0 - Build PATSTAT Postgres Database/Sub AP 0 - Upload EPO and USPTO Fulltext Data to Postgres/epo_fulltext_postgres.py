@@ -9,11 +9,11 @@ tqdm.pandas()
 # Database connection details
 url_object = URL.create(
     drivername='postgresql+psycopg2',
-    username='tie',
-    password='TIE%2023!tuhh',
-    host='127.0.0.1',
-    port=65432,
-    database='PATSTAT_2023',
+    username=user,
+    password=password,
+    host=host,
+    port=port,
+    database=database,
 )
 engine = create_engine(url_object) #, echo=True)
 
