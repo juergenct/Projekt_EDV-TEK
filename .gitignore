@@ -9,6 +9,29 @@ __pycache__/
 # C extensions
 *.so
 
+# Ignore certain file types
+*.csv
+*.h5
+*.hdf5
+*.pickle
+*.pkl
+*.json
+*.yaml
+*.yml
+*.xml
+*.txt
+*.log
+*.tsv
+*.zip
+*.sh
+*.parquet
+*.pt
+*.html
+*.md
+*.pdf
+*.png
+*.npy
+
 # Distribution / packaging
 .Python
 build/
