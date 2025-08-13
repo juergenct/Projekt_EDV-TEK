@@ -11,10 +11,9 @@ Die Entstehungsphase untersucht den Ursprung der TEKs und inwieweit sie auf wiss
 ## Diffusion
 In der Diffusionsphase soll untersucht werden, wie sich TEKs innerhalb und über verschiedene Technologiebereiche hinweg verbreiten. Diese Analyse liefert konkrete Erkenntnisse für politische Entscheidungsträger, um die hohe Diffusion von TEKs zu fördern. Durch das Verständnis der Muster der TEK-Diffusion wird das Projekt untersuchen, ob Technologien mit einem höheren Grad an Neuartigkeit schneller diffundieren oder eher von anderen Technologiebereichen übernommen werden. Die Ergebnisse sollen zudem die Faktoren beleuchten, die zur schnellen Annahme und Verbreitung innovativer TEKs beitragen.
 
-## Verwertung
 Die Verwertungsphase konzentriert sich auf die kommerziellen Aspekte der TEKs. Dies beinhaltet die Bewertung, welche TEKs eher von Startups kommerzialisiert werden und welche aufgrund ihrer Neuartigkeit ein höheres Potenzial aufweisen. Die Ergebnisse des Projekts werden auch zeigen, welche Rolle die Neuartigkeit bei der erfolgreichen Kommerzialisierung von TEKs spielt. Letztendlich haben die Erkenntnisse praktische Anwendungen für Unternehmen, Startups und politische Entscheidungsträger, die zukünftige Maßnahmen im Bereich der Technologien zur Minderung des Klimawandels leiten.
 
 <div align="center" style="background-color: white; padding: 10px;">
-  <img src="https://github.com/juergenct/Projekt_EDV-TEK/assets/122016233/5e7d066c-8896-4e88-a475-a6fcaf7fcb64" height="150px" style="display: inline-block; margin-right: 10px;">
+  <img src="https://github.com/user-attachments/assets/ac50ffac-51dd-4db2-9a50-202b369db77e" height="150px" style="display: inline-block; margin-right: 10px;">
   <img src="https://github.com/juergenct/Projekt_EDV-TEK/assets/122016233/d67e106f-e0c7-4a11-86d3-688a27cdbe5d" height="150px" style="display: inline-block;">
 </div>
