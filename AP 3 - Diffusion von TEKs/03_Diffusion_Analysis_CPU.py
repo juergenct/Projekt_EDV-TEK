@@ -16,9 +16,10 @@ import plotly.graph_objects as go
 import networkx as nx
 
 # Set constants
-SIMILARITY_THRESHOLD = 0.95  # Very high threshold for similarity
-# MAX_TIME_LAG_DAYS = 3650  # 10 years maximum time lag
-MAX_TIME_LAG_DAYS = 1825  # 5 years maximum time lag
+MIN_SIMILARITY_THRESHOLD = 0.92  # Very high threshold for similarity
+MAX_SIMILARITY_THRESHOLD = 0.98  # Very high threshold for similarity
+# MAX_TIME_LAG_DAYS = 365 * 10  # 10 years in days
+MAX_TIME_LAG_DAYS = 365 * 20 # 20 years in days
 BATCH_YEARS = 5  # Process in 5-year batches
 TOP_K_NEIGHBORS = 20  # Only consider top 20 similar patents
 MIN_YEAR = 1980
@@ -63,10 +64,10 @@ def process_y02_class(args):
     # Ensure application IDs are scalar values
     class_df = class_df.copy()
 
-    # Sample 5000 patents if class is too large
-    if len(class_df) > 5000:
-        print(f"Class {y02_class} is too large, sampling 5000 patents")
-        class_df = class_df.sample(5000, random_state=42)
+    # Sample 100000 patents if class is too large
+    if len(class_df) > 100000:
+        print(f"Class {y02_class} is too large, sampling 100000 patents")
+        class_df = class_df.sample(100000, random_state=42)
 
     if isinstance(class_df['appln_id'].iloc[0], np.ndarray):
         class_df['appln_id'] = class_df['appln_id'].apply(lambda x: x.item() if isinstance(x, np.ndarray) else x)
@@ -80,60 +81,57 @@ def process_y02_class(args):
     # Sort by publication date
     class_df = class_df.sort_values('publn_date')
     
-    # First, analyze citation links
-    processed_pairs = set()
+    # Create fast lookup structures
+    class_appln_ids = set(class_df['appln_id'])
+    appln_to_date = dict(zip(class_df['appln_id'], class_df['publn_date']))
+    appln_to_auth = dict(zip(class_df['appln_id'], class_df['publn_auth']))
     
-    # Phase 1: Process citation links
-    for i, (_, source) in enumerate(class_df.iterrows()):
-        # Get later patents in the same class
-        targets = class_df.iloc[i+1:].copy()
+    # Phase 1: Process citation links using inverted logic
+    citation_pairs = set()  # Store only actual citation pairs
+    
+    # Group by appln_id to process each patent once
+    grouped = class_df.groupby('appln_id')
+    
+    for citing_patent, group in grouped:
+        citing_date = appln_to_date[citing_patent]
+        citing_auth = appln_to_auth[citing_patent]
         
-        # Apply time lag filter
-        targets = targets[
-            (pd.to_datetime(targets['publn_date']) - pd.to_datetime(source['publn_date'])).dt.days <= MAX_TIME_LAG_DAYS
-        ]
-        
-        for _, target in targets.iterrows():
-            # Skip if same patent
-            if source['appln_id'] == target['appln_id']:
-                continue
-            
-            # Skip if already processed
-            pair_key = (source['appln_id'], target['appln_id'])
-            if pair_key in processed_pairs:
-                continue
-            
-            processed_pairs.add(pair_key)
-            
-            # Check if there's a citation
-            citation = False
-            if not (isinstance(target['cited_appln_id'], float) and pd.isna(target['cited_appln_id'])) and not (isinstance(target['cited_appln_id'], (list, np.ndarray)) and len(target['cited_appln_id']) == 0):
-                cited_ids = parse_list_string(target['cited_appln_id'])
-                # Get scalar value for appln_id if it's a NumPy array
-                source_appln_id = source['appln_id']
-                if isinstance(source_appln_id, np.ndarray):
-                    source_appln_id = source_appln_id.item()
-                citation = source_appln_id in cited_ids
-            
-            # Record citation-based diffusion
-            if citation:
-                time_diff = (pd.to_datetime(target['publn_date']) - 
-                            pd.to_datetime(source['publn_date'])).days
+        # Get all cited patents for this citing patent
+        for _, row in group.iterrows():
+            if not (isinstance(row['cited_appln_id'], float) and pd.isna(row['cited_appln_id'])) and not (isinstance(row['cited_appln_id'], (list, np.ndarray)) and len(row['cited_appln_id']) == 0):
+                cited_ids = parse_list_string(row['cited_appln_id'])
                 
-                results.append({
-                    'source_id': source['appln_id'],
-                    'target_id': target['appln_id'],
-                    'source_auth': source['publn_auth'],
-                    'target_auth': target['publn_auth'],
-                    'source_class': y02_class,
-                    'target_class': y02_class,
-                    'time_lag_days': time_diff,
-                    'has_citation': True,
-                    'similarity_score': None,  # Don't compute for citations
-                    'diffusion_type': 'within',
-                    'source_date': source['publn_date'],
-                    'target_date': target['publn_date']
-                })
+                for cited_patent in cited_ids:
+                    # Check if cited patent is also in the same Y02 class
+                    if cited_patent in class_appln_ids:
+                        cited_date = appln_to_date[cited_patent]
+                        cited_auth = appln_to_auth[cited_patent]
+                        
+                        # Check time ordering and lag
+                        time_diff = (pd.to_datetime(citing_date) - pd.to_datetime(cited_date)).days
+                        if time_diff <= 0 or time_diff > MAX_TIME_LAG_DAYS:
+                            continue
+                        
+                        # Create a unique pair identifier (sorted to avoid duplicates)
+                        pair_id = tuple(sorted([cited_patent, citing_patent]))
+                        
+                        if pair_id not in citation_pairs:
+                            citation_pairs.add(pair_id)
+                            
+                            results.append({
+                                'source_id': cited_patent,
+                                'target_id': citing_patent,
+                                'source_auth': cited_auth,
+                                'target_auth': citing_auth,
+                                'source_class': y02_class,
+                                'target_class': y02_class,
+                                'time_lag_days': time_diff,
+                                'has_citation': True,
+                                'similarity_score': None,  # Don't compute for citations
+                                'diffusion_type': 'within',
+                                'source_date': cited_date,
+                                'target_date': citing_date
+                            })
     
     # Phase 2: Process similarity links (for non-citation pairs)
     # Create FAISS index for this class
@@ -171,8 +169,8 @@ def process_y02_class(args):
         
         # Process results
         for j, (sim_score, sim_idx) in enumerate(zip(D[0], I[0])):
-            # Skip if similarity is below threshold
-            if sim_score < SIMILARITY_THRESHOLD:
+            # Skip if similarity is outside threshold range (already correct)
+            if not (MIN_SIMILARITY_THRESHOLD <= sim_score <= MAX_SIMILARITY_THRESHOLD):
                 continue
             
             # Get the similar patent 
@@ -197,26 +195,24 @@ def process_y02_class(args):
                 continue
             
             # Skip if already processed as a citation
-            pair_key = (source['appln_id'], target['appln_id'])
-            if pair_key in processed_pairs:
+            pair_key = tuple(sorted([source['appln_id'], target['appln_id']]))
+            if pair_key in citation_pairs:
                 continue
             
-            processed_pairs.add(pair_key)
-            
-            # Record similarity-based diffusion
+            # Record similarity-based diffusion using fast lookup dictionaries
             results.append({
                 'source_id': source['appln_id'],
                 'target_id': target['appln_id'],
-                'source_auth': source['publn_auth'],
-                'target_auth': target['publn_auth'],
+                'source_auth': appln_to_auth[source['appln_id']],
+                'target_auth': appln_to_auth[target['appln_id']],
                 'source_class': y02_class,
                 'target_class': y02_class,
                 'time_lag_days': time_diff,
                 'has_citation': False,
                 'similarity_score': float(sim_score),
                 'diffusion_type': 'within',
-                'source_date': source['publn_date'],
-                'target_date': target['publn_date']
+                'source_date': appln_to_date[source['appln_id']],
+                'target_date': appln_to_date[target['appln_id']]
             })
     
     # Clear index to free memory
@@ -230,8 +226,12 @@ def compute_within_class_diffusion(df, embeddings):
     Compute diffusion metrics for patents within the same Y02 class.
     Uses parallel processing for different Y02 classes.
     """
-    # Determine optimal number of workers
-    num_workers = min(mp.cpu_count(), 8)
+    # Dynamic CPU core utilization
+    slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
+    if slurm_cpus:
+        num_workers = int(slurm_cpus)
+    else:
+        num_workers = mp.cpu_count()
     
     # Create arguments for each Y02 class
     class_args = []
@@ -285,6 +285,10 @@ def process_between_batch(args):
     source_app_to_classes = source_patents.groupby('appln_id')['y02_class'].apply(set).to_dict()
     target_app_to_classes = target_patents.groupby('appln_id')['y02_class'].apply(set).to_dict()
     
+    # Create fast lookup dictionaries for metadata (PERFORMANCE OPTIMIZATION)
+    source_app_to_date = dict(zip(source_patents['appln_id'], source_patents['publn_date']))
+    source_app_to_auth = dict(zip(source_patents['appln_id'], source_patents['publn_auth']))
+    
     # Phase 1: Process citation links first
     processed_citation_pairs = set()
     
@@ -323,19 +327,19 @@ def process_between_batch(args):
                     if source_class == target_class:
                         continue
                     
-                    # Calculate time difference
-                    source_date = source_patents[source_patents['appln_id'] == cited_app_id]['publn_date'].iloc[0]
+                    # Calculate time difference using fast lookup
+                    source_date = source_app_to_date[cited_app_id]
                     time_diff = (pd.to_datetime(target['publn_date']) - pd.to_datetime(source_date)).days
                     
                     # Skip if time lag exceeds maximum
                     if time_diff > MAX_TIME_LAG_DAYS:
                         continue
                     
-                    # Record citation-based diffusion
+                    # Record citation-based diffusion using fast lookup
                     results.append({
                         'source_id': cited_app_id,
                         'target_id': target['appln_id'],
-                        'source_auth': source_patents[source_patents['appln_id'] == cited_app_id]['publn_auth'].iloc[0],
+                        'source_auth': source_app_to_auth[cited_app_id],
                         'target_auth': target['publn_auth'],
                         'source_class': source_class,
                         'target_class': target_class,
@@ -374,6 +378,10 @@ def process_between_batch(args):
     # Create mappings for faster lookup
     source_idx_to_app = {i: row['appln_id'] for i, (_, row) in enumerate(unique_source_patents.iterrows())}
     
+    # Create fast lookup dictionaries for unique source patents metadata (PERFORMANCE OPTIMIZATION)
+    unique_source_app_to_date = dict(zip(unique_source_patents['appln_id'], unique_source_patents['publn_date']))
+    unique_source_app_to_auth = dict(zip(unique_source_patents['appln_id'], unique_source_patents['publn_auth']))
+    
     # For each target patent, find similar source patents
     for i, (_, target) in enumerate(unique_target_patents.iterrows()):
         target_app_id = target['appln_id']
@@ -384,8 +392,8 @@ def process_between_batch(args):
         
         # Process results
         for j, (sim_score, sim_idx) in enumerate(zip(D[0], I[0])):
-            # Skip if similarity is below threshold
-            if sim_score < SIMILARITY_THRESHOLD:
+            # Skip if similarity is outside threshold range (already correct)
+            if not (MIN_SIMILARITY_THRESHOLD <= sim_score <= MAX_SIMILARITY_THRESHOLD):
                 continue
             
             # Get the similar source patent
@@ -412,19 +420,19 @@ def process_between_batch(args):
                     if source_class == target_class:
                         continue
                     
-                    # Calculate time difference
-                    source_date = unique_source_patents[unique_source_patents['appln_id'] == source_app_id]['publn_date'].iloc[0]
+                    # Calculate time difference using fast lookup (PERFORMANCE OPTIMIZATION)
+                    source_date = unique_source_app_to_date[source_app_id]
                     time_diff = (pd.to_datetime(target['publn_date']) - pd.to_datetime(source_date)).days
                     
                     # Skip if time lag exceeds maximum
                     if time_diff > MAX_TIME_LAG_DAYS:
                         continue
                     
-                    # Record similarity-based diffusion
+                    # Record similarity-based diffusion using fast lookup (PERFORMANCE OPTIMIZATION)
                     results.append({
                         'source_id': source_app_id,
                         'target_id': target_app_id,
-                        'source_auth': unique_source_patents[unique_source_patents['appln_id'] == source_app_id]['publn_auth'].iloc[0],
+                        'source_auth': unique_source_app_to_auth[source_app_id],
                         'target_auth': target['publn_auth'],
                         'source_class': source_class,
                         'target_class': target_class,
@@ -447,8 +455,12 @@ def compute_between_class_diffusion(df, embeddings, batch_years=BATCH_YEARS):
     Compute diffusion metrics between different Y02 classes.
     Uses parallel processing for different time batches.
     """
-    # Determine optimal number of workers
-    num_workers = min(mp.cpu_count(), 8)
+    # Dynamic CPU core utilization
+    slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
+    if slurm_cpus:
+        num_workers = int(slurm_cpus)
+    else:
+        num_workers = mp.cpu_count()
     
     # Add year column for batching if it doesn't exist
     if 'year' not in df.columns:
@@ -479,74 +491,86 @@ def compute_between_class_diffusion(df, embeddings, batch_years=BATCH_YEARS):
     
     return pd.DataFrame(all_results)
 
-# Function to process a single time batch for international diffusion
-def process_international_batch(args):
-    """Process a single time batch for international diffusion (US to EP)."""
-    start_year, end_year, df, embeddings = args
+# Function to process a single time batch for directional international diffusion
+def process_international_batch_directional(args):
+    """Process a single time batch for directional international diffusion."""
+    start_year, end_year, df, embeddings, source_auth, target_auth = args
+    
+    # Get US and EP classes from the data
+    us_classes = df[df['publn_auth'] == 'US']['y02_class'].unique()
+    ep_classes = df[df['publn_auth'] == 'EP']['y02_class'].unique()
+    
+    # Filter US and EP patents
+    us_patents = df[df['publn_auth'] == 'US']
+    ep_patents = df[df['publn_auth'] == 'EP']
     
     # Calculate comparison end year
     comparison_end = min(end_year + (MAX_TIME_LAG_DAYS // 365), df['year'].max())
     
     results = []
     
-    # Get US patents (source)
-    us_patents = df[(df['publn_auth'] == 'US') & 
-                    (df['year'] >= start_year) & 
-                    (df['year'] < end_year)].copy()
+    # Get source patents
+    source_patents = df[(df['publn_auth'] == source_auth) &
+                       (df['year'] >= start_year) &
+                       (df['year'] < end_year)].copy()
     
-    # Get EP patents (target) that come after the US patents
-    ep_patents = df[(df['publn_auth'] == 'EP') & 
-                    (df['year'] >= end_year) & 
-                    (df['year'] <= comparison_end)].copy()
+    # Get target patents that come after the source patents
+    target_patents = df[(df['publn_auth'] == target_auth) &
+                       (df['year'] >= end_year) &
+                       (df['year'] <= comparison_end)].copy()
     
     # Skip if either set is empty
-    if len(us_patents) == 0 or len(ep_patents) == 0:
-        return results
+    if len(source_patents) == 0 or len(target_patents) == 0:
+        return {'citation': [], 'semantic': []}
     
     # Create application ID to index mapping for faster lookup
-    us_app_to_idx = {row['appln_id']: i for i, (_, row) in enumerate(us_patents.iterrows())}
+    source_app_to_idx = {row['appln_id']: i for i, (_, row) in enumerate(source_patents.iterrows())}
     
     # Create mapping from application ID to Y02 classes
-    us_app_to_classes = us_patents.groupby('appln_id')['y02_class'].apply(set).to_dict()
-    ep_app_to_classes = ep_patents.groupby('appln_id')['y02_class'].apply(set).to_dict()
+    source_app_to_classes = source_patents.groupby('appln_id')['y02_class'].apply(set).to_dict()
+    target_app_to_classes = target_patents.groupby('appln_id')['y02_class'].apply(set).to_dict()
+    
+    # Create fast lookup dictionaries for metadata (PERFORMANCE OPTIMIZATION)
+    source_app_to_date = dict(zip(source_patents['appln_id'], source_patents['publn_date']))
+    source_app_to_auth = dict(zip(source_patents['appln_id'], source_patents['publn_auth']))
     
     # Phase 1: Process citation links first
     processed_citation_pairs = set()
     
     # Process international citation links
-    for _, ep_patent in ep_patents.iterrows():
+    for _, target_patent in target_patents.iterrows():
         # Skip if no citations
-        if isinstance(ep_patent['cited_appln_id'], float) and pd.isna(ep_patent['cited_appln_id']) or (isinstance(ep_patent['cited_appln_id'], (list, np.ndarray)) and len(ep_patent['cited_appln_id']) == 0):
+        if isinstance(target_patent['cited_appln_id'], float) and pd.isna(target_patent['cited_appln_id']) or (isinstance(target_patent['cited_appln_id'], (list, np.ndarray)) and len(target_patent['cited_appln_id']) == 0):
             continue
             
         # Get cited application IDs
-        cited_app_ids = parse_list_string(ep_patent['cited_appln_id'])
+        cited_app_ids = parse_list_string(target_patent['cited_appln_id'])
         
         # Find cited US applications
         for cited_app_id in cited_app_ids:
-            # Skip if not in our US patents
-            if cited_app_id not in us_app_to_idx:
+            # Skip if not in our source patents
+            if cited_app_id not in source_app_to_idx:
                 continue
             
             # Skip if already processed
-            pair_key = (cited_app_id, ep_patent['appln_id'])
+            pair_key = (cited_app_id, target_patent['appln_id'])
             if pair_key in processed_citation_pairs:
                 continue
             
             processed_citation_pairs.add(pair_key)
             
-            # Get US Y02 classes
-            us_classes = us_app_to_classes.get(cited_app_id, set())
+            # Get source Y02 classes
+            source_classes = source_app_to_classes.get(cited_app_id, set())
             
             # Get EP Y02 classes
-            ep_classes = ep_app_to_classes.get(ep_patent['appln_id'], set())
+            target_classes = target_app_to_classes.get(target_patent['appln_id'], set())
             
             # Find all class combinations
-            for us_class in us_classes:
-                for ep_class in ep_classes:
-                    # Calculate time difference
-                    us_date = us_patents[us_patents['appln_id'] == cited_app_id]['publn_date'].iloc[0]
-                    time_diff = (pd.to_datetime(ep_patent['publn_date']) - pd.to_datetime(us_date)).days
+            for source_class in source_classes:
+                for target_class in target_classes:
+                    # Calculate time difference using fast lookup (PERFORMANCE OPTIMIZATION)
+                    source_date = source_app_to_date[cited_app_id]
+                    time_diff = (pd.to_datetime(target_patent['publn_date']) - pd.to_datetime(source_date)).days
                     
                     # Skip if time lag exceeds maximum
                     if time_diff > MAX_TIME_LAG_DAYS:
@@ -555,117 +579,132 @@ def process_international_batch(args):
                     # Record citation-based diffusion
                     results.append({
                         'source_id': cited_app_id,
-                        'target_id': ep_patent['appln_id'],
-                        'source_auth': 'US',
-                        'target_auth': 'EP',
-                        'source_class': us_class,
-                        'target_class': ep_class,
+                        'target_id': target_patent['appln_id'],
+                        'source_auth': source_auth,
+                        'target_auth': target_auth,
+                        'source_class': source_class,
+                        'target_class': target_class,
                         'time_lag_days': time_diff,
                         'has_citation': True,
                         'similarity_score': None,  # Don't compute for citations
                         'diffusion_type': 'international',
-                        'source_date': us_date,
-                        'target_date': ep_patent['publn_date']
+                        'source_date': source_date,
+                        'target_date': target_patent['publn_date']
                     })
     
     # Phase 2: Process similarity links using FAISS
     # Filter to unique patents to avoid duplicate embeddings
-    unique_us_patents = us_patents.drop_duplicates('appln_id').copy()
-    unique_ep_patents = ep_patents.drop_duplicates('appln_id').copy()
+    unique_source_patents = source_patents.drop_duplicates('appln_id').copy()
+    unique_target_patents = target_patents.drop_duplicates('appln_id').copy()
     
-    # Get embeddings for US patents
-    us_original_indices = unique_us_patents['original_index'].values
-    us_embeddings = embeddings[us_original_indices]
+    # Get embeddings for source patents
+    source_original_indices = unique_source_patents['original_index'].values
+    source_embeddings = embeddings[source_original_indices]
     
-    # Get embeddings for EP patents
-    ep_original_indices = unique_ep_patents['original_index'].values
-    ep_embeddings = embeddings[ep_original_indices]
+    # Get embeddings for target patents
+    target_original_indices = unique_target_patents['original_index'].values
+    target_embeddings = embeddings[target_original_indices]
     
-    # Build FAISS index for US patents
-    dim = us_embeddings.shape[1]
-    us_index = faiss.IndexFlatIP(dim)  # Inner product for cosine similarity
+    # Build FAISS index for source patents
+    dim = source_embeddings.shape[1]
+    source_index = faiss.IndexFlatIP(dim)  # Inner product for cosine similarity
     
     # Normalize for cosine similarity
-    faiss.normalize_L2(us_embeddings)
-    us_index.add(us_embeddings)
+    faiss.normalize_L2(source_embeddings)
+    source_index.add(source_embeddings)
     
-    # Normalize EP embeddings
-    faiss.normalize_L2(ep_embeddings)
+    # Normalize target embeddings
+    faiss.normalize_L2(target_embeddings)
     
     # Create mapping for faster lookup
-    us_idx_to_app = {i: row['appln_id'] for i, (_, row) in enumerate(unique_us_patents.iterrows())}
+    source_idx_to_app = {i: row['appln_id'] for i, (_, row) in enumerate(unique_source_patents.iterrows())}
     
-    # For each EP patent, find similar US patents
-    for i, (_, ep_patent) in enumerate(unique_ep_patents.iterrows()):
-        ep_app_id = ep_patent['appln_id']
-        ep_embedding = ep_embeddings[i].reshape(1, -1)
+    # Create fast lookup dictionaries for unique source patents metadata (PERFORMANCE OPTIMIZATION)
+    unique_source_app_to_date = dict(zip(unique_source_patents['appln_id'], unique_source_patents['publn_date']))
+    unique_source_app_to_auth = dict(zip(unique_source_patents['appln_id'], unique_source_patents['publn_auth']))
+    
+    # For each target patent, find similar source patents
+    for i, (_, target_patent) in enumerate(unique_target_patents.iterrows()):
+        target_app_id = target_patent['appln_id']
+        target_embedding = target_embeddings[i].reshape(1, -1)
         
-        # Search for similar US patents
-        D, I = us_index.search(ep_embedding, TOP_K_NEIGHBORS)
+        # Search for similar source patents
+        D, I = source_index.search(target_embedding, TOP_K_NEIGHBORS)
         
         # Process results
         for j, (sim_score, sim_idx) in enumerate(zip(D[0], I[0])):
-            # Skip if similarity is below threshold
-            if sim_score < SIMILARITY_THRESHOLD:
+            # Skip if similarity is outside threshold range (already correct)
+            if not (MIN_SIMILARITY_THRESHOLD <= sim_score <= MAX_SIMILARITY_THRESHOLD):
                 continue
             
-            # Get the similar US patent
-            if sim_idx >= len(us_idx_to_app):
+            # Get the similar source patent
+            if sim_idx >= len(source_idx_to_app):
                 continue
                 
-            us_app_id = us_idx_to_app[sim_idx]
+            source_app_id = source_idx_to_app[sim_idx]
             
             # Skip if already processed as a citation
-            pair_key = (us_app_id, ep_app_id)
+            pair_key = (source_app_id, target_app_id)
             if pair_key in processed_citation_pairs:
                 continue
             
             # Get US Y02 classes
-            us_classes = us_app_to_classes.get(us_app_id, set())
+            source_classes = source_app_to_classes.get(source_app_id, set())
             
-            # Get EP Y02 classes
-            ep_classes = ep_app_to_classes.get(ep_app_id, set())
+            # Get target Y02 classes
+            target_classes = target_app_to_classes.get(target_app_id, set())
             
             # Find all class combinations
-            for us_class in us_classes:
-                for ep_class in ep_classes:
-                    # Calculate time difference
-                    us_date = unique_us_patents[unique_us_patents['appln_id'] == us_app_id]['publn_date'].iloc[0]
-                    time_diff = (pd.to_datetime(ep_patent['publn_date']) - pd.to_datetime(us_date)).days
+            for source_class in source_classes:
+                for target_class in target_classes:
+                    # Calculate time difference using fast lookup (PERFORMANCE OPTIMIZATION)
+                    source_date = unique_source_app_to_date[source_app_id]
+                    time_diff = (pd.to_datetime(target_patent['publn_date']) - pd.to_datetime(source_date)).days
                     
                     # Skip if time lag exceeds maximum
                     if time_diff > MAX_TIME_LAG_DAYS:
                         continue
                     
-                    # Record similarity-based diffusion
+                    # Record similarity-based diffusion using fast lookup (PERFORMANCE OPTIMIZATION)
                     results.append({
-                        'source_id': us_app_id,
-                        'target_id': ep_app_id,
-                        'source_auth': 'US',
-                        'target_auth': 'EP',
-                        'source_class': us_class,
-                        'target_class': ep_class,
+                        'source_id': source_app_id,
+                        'target_id': target_app_id,
+                        'source_auth': source_auth,
+                        'target_auth': target_auth,
+                        'source_class': source_class,
+                        'target_class': target_class,
                         'time_lag_days': time_diff,
                         'has_citation': False,
                         'similarity_score': float(sim_score),
                         'diffusion_type': 'international',
-                        'source_date': us_date,
-                        'target_date': ep_patent['publn_date']
+                        'source_date': source_date,
+                        'target_date': target_patent['publn_date']
                     })
     
     # Clear memory
-    del us_patents, ep_patents, us_index
+    del source_patents, target_patents, source_index
     gc.collect()
     
-    return results
+    # Split results into citation and semantic
+    citation_results = [r for r in results if r['has_citation']]
+    semantic_results = [r for r in results if not r['has_citation']]
+    
+    return {
+        'citation': citation_results,
+        'semantic': semantic_results
+    }
 
 def compute_international_diffusion(df, embeddings, batch_years=BATCH_YEARS):
     """
-    Compute international diffusion metrics (US to EP patents).
-    Uses parallel processing for different time batches.
+    Compute bidirectional international diffusion metrics (US<->EP patents).
+    Uses parallel processing for different time batches and directions.
     """
-    # Determine optimal number of workers
-    num_workers = min(mp.cpu_count(), 8)
+    # Dynamic CPU core utilization
+    slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK')
+    if slurm_cpus:
+        num_workers = int(slurm_cpus)
+    else:
+        num_workers = mp.cpu_count()
     
     # Add year column for batching if it doesn't exist
     if 'year' not in df.columns:
@@ -677,210 +716,306 @@ def compute_international_diffusion(df, embeddings, batch_years=BATCH_YEARS):
     batch_args = []
     for start_year in range(year_min, year_max, batch_years):
         end_year = start_year + batch_years
-        batch_args.append((start_year, end_year, df, embeddings))
+        # Add arguments for both directions
+        batch_args.append((start_year, end_year, df, embeddings, 'US', 'EP'))
+        batch_args.append((start_year, end_year, df, embeddings, 'EP', 'US'))
     
     print(f"Processing {len(batch_args)} time batches using {num_workers} workers")
     
     # Process batches in parallel
     with mp.Pool(processes=min(len(batch_args), num_workers)) as pool:
         results_list = list(tqdm_auto(
-            pool.imap(process_international_batch, batch_args),
+            pool.imap(process_international_batch_directional, batch_args),
             total=len(batch_args),
-            desc="Processing time batches for international diffusion"
+            desc="Processing time batches for bidirectional international diffusion"
         ))
     
-    # Combine results
-    all_results = []
-    for results in results_list:
-        all_results.extend(results)
+    # Combine and separate results
+    all_citation_results = []
+    all_semantic_results = []
     
-    return pd.DataFrame(all_results)
+    for batch_results in results_list:
+        all_citation_results.extend(batch_results['citation'])
+        all_semantic_results.extend(batch_results['semantic'])
+    
+    # Create output directories
+    output_dir = os.path.join('results', 'international_diffusion')
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'citation'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'semantic'), exist_ok=True)
+    
+    # Save citation results
+    if all_citation_results:
+        citation_df = pd.DataFrame(all_citation_results)
+        for (source, target), group in citation_df.groupby(['source_auth', 'target_auth']):
+            citation_file = os.path.join(output_dir, 'citation',
+                                       f'international_diffusion_{source}_to_{target}_citation.csv')
+            group.to_csv(citation_file, index=False)
+
+    # Save semantic results
+    if all_semantic_results:
+        semantic_df = pd.DataFrame(all_semantic_results)
+        for (source, target), group in semantic_df.groupby(['source_auth', 'target_auth']):
+            semantic_file = os.path.join(output_dir, 'semantic',
+                                       f'international_diffusion_{source}_to_{target}_semantic.csv')
+            group.to_csv(semantic_file, index=False)
+    
+    # Return combined results for visualization
+    return pd.DataFrame(all_citation_results + all_semantic_results)
 
 def create_visualizations(diffusion_df, patents_df):
-    """Create visualizations for diffusion analysis and save as HTML files."""
+    """Create visualizations for diffusion analysis and save as HTML and PNG files."""
+    # Create base visualization directory and mechanism-specific subdirectories
     os.makedirs('visualizations', exist_ok=True)
+    os.makedirs('visualizations/citation', exist_ok=True)
+    os.makedirs('visualizations/semantic', exist_ok=True)
+    os.makedirs('visualizations/combined', exist_ok=True)
     
-    # 1. Diffusion time distribution by type
-    fig = go.Figure()
-    
-    for diff_type in diffusion_df['diffusion_type'].unique():
-        subset = diffusion_df[diffusion_df['diffusion_type'] == diff_type]
-        fig.add_trace(go.Histogram(
-            x=subset['time_lag_days'] / 365.25,
-            name=diff_type,
-            opacity=0.7,
-            nbinsx=20
-        ))
-    
-    fig.update_layout(
-        title='Distribution of Diffusion Time by Diffusion Type',
-        xaxis_title='Diffusion Time (Years)',
-        yaxis_title='Count',
-        barmode='overlay',
-        legend_title='Diffusion Type'
-    )
-    
-    fig.write_html('visualizations/diffusion_time_distribution.html')
+    # Create visualizations for each mechanism separately and combined
+    for mechanism, suffix, title_suffix in [
+        (diffusion_df[diffusion_df['has_citation']], '_citation', ' (Citation-based)'),
+        (diffusion_df[~diffusion_df['has_citation']], '_semantic', ' (Semantic Similarity-based)'),
+        (diffusion_df, '', '')
+    ]:
+        if len(mechanism) == 0:
+            continue
+            
+        # Determine output directory
+        output_dir = 'visualizations/combined' if not suffix else f'visualizations/{suffix[1:]}'
+        
+        # 1. Diffusion time distribution by type
+        fig = go.Figure()
+        
+        for diff_type in mechanism['diffusion_type'].unique():
+            subset = mechanism[mechanism['diffusion_type'] == diff_type]
+            fig.add_trace(go.Histogram(
+                x=subset['time_lag_days'] / 365.25,
+                name=diff_type,
+                opacity=0.7,
+                nbinsx=20
+            ))
+        
+        fig.update_layout(
+            title=f'Distribution of Diffusion Time by Diffusion Type{title_suffix}',
+            xaxis_title='Diffusion Time (Years)',
+            yaxis_title='Count',
+            barmode='overlay',
+            legend_title='Diffusion Type'
+        )
+        
+        # Save both HTML and PNG versions
+        fig.write_html(f'{output_dir}/diffusion_time_distribution{suffix}.html')
+        fig.write_image(f'{output_dir}/diffusion_time_distribution{suffix}.png', engine='kaleido')
     
     # 2. Diffusion network between Y02 classes
-    between_df = diffusion_df[diffusion_df['diffusion_type'] == 'between']
-    G = nx.DiGraph()
-    
-    # Add edges with weight based on count
-    class_counts = between_df.groupby(['source_class', 'target_class']).size().reset_index(name='count')
-    for _, row in class_counts.iterrows():
-        G.add_edge(row['source_class'], row['target_class'], weight=row['count'])
-    
-    # Calculate node sizes based on degree
-    node_sizes = {node: G.degree(node) * 10 for node in G.nodes()}
-    
-    # Create positions for nodes
-    pos = nx.spring_layout(G, seed=42)
-    
-    # Create edge traces
-    edge_traces = []
-    for edge in G.edges():
-        x0, y0 = pos[edge[0]]
-        x1, y1 = pos[edge[1]]
-        weight = G[edge[0]][edge[1]]['weight']
+    for mechanism, suffix, title_suffix in [
+        (diffusion_df[(diffusion_df['diffusion_type'] == 'between') & (diffusion_df['has_citation'])], '_citation', ' (Citation-based)'),
+        (diffusion_df[(diffusion_df['diffusion_type'] == 'between') & (~diffusion_df['has_citation'])], '_semantic', ' (Semantic Similarity-based)'),
+        (diffusion_df[diffusion_df['diffusion_type'] == 'between'], '', '')
+    ]:
+        if len(mechanism) == 0:
+            continue
+            
+        output_dir = 'visualizations/combined' if not suffix else f'visualizations/{suffix[1:]}'
+        between_df = mechanism
+        G = nx.DiGraph()
         
-        # Create arrow shape
-        edge_trace = go.Scatter(
-            x=[x0, x1, None],
-            y=[y0, y1, None],
-            line=dict(width=weight/max(class_counts['count'])*10, color='#888'),
-            hoverinfo='text',
-            text=f'{edge[0]} → {edge[1]}: {weight} connections',
-            mode='lines'
+        # Add edges with weight based on count
+        class_counts = between_df.groupby(['source_class', 'target_class']).size().reset_index(name='count')
+        for _, row in class_counts.iterrows():
+            G.add_edge(row['source_class'], row['target_class'], weight=row['count'])
+        
+        # Calculate node sizes based on degree
+        node_sizes = {node: G.degree(node) * 10 for node in G.nodes()}
+        
+        # Create positions for nodes
+        pos = nx.spring_layout(G, seed=42)
+        
+        # Create edge traces
+        edge_traces = []
+        for edge in G.edges():
+            x0, y0 = pos[edge[0]]
+            x1, y1 = pos[edge[1]]
+            weight = G[edge[0]][edge[1]]['weight']
+            
+            # Create arrow shape
+            edge_trace = go.Scatter(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                line=dict(width=weight/max(class_counts['count'])*10, color='#888'),
+                hoverinfo='text',
+                text=f'{edge[0]} → {edge[1]}: {weight} connections',
+                mode='lines'
+            )
+            edge_traces.append(edge_trace)
+        
+        # Create node trace
+        node_trace = go.Scatter(
+            x=[pos[node][0] for node in G.nodes()],
+            y=[pos[node][1] for node in G.nodes()],
+            text=[f"{node}: {G.degree(node)} connections" for node in G.nodes()],
+            mode='markers+text',
+            textposition='top center',
+            marker=dict(
+                size=[node_sizes[node] for node in G.nodes()],
+                color='skyblue',
+                line=dict(width=2, color='#333')
+            )
         )
-        edge_traces.append(edge_trace)
-    
-    # Create node trace
-    node_trace = go.Scatter(
-        x=[pos[node][0] for node in G.nodes()],
-        y=[pos[node][1] for node in G.nodes()],
-        text=[f"{node}: {G.degree(node)} connections" for node in G.nodes()],
-        mode='markers+text',
-        textposition='top center',
-        marker=dict(
-            size=[node_sizes[node] for node in G.nodes()],
-            color='skyblue',
-            line=dict(width=2, color='#333')
+        
+        # Create figure
+        fig = go.Figure(data=edge_traces + [node_trace])
+        fig.update_layout(
+            title=f'Diffusion Network Between Y02 Classes{title_suffix}',
+            showlegend=False,
+            hovermode='closest',
+            margin=dict(b=0, l=0, r=0, t=40),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            width=800,
+            height=800
         )
-    )
-    
-    # Create figure
-    fig = go.Figure(data=edge_traces + [node_trace])
-    fig.update_layout(
-        title='Diffusion Network Between Y02 Classes',
-        showlegend=False,
-        hovermode='closest',
-        margin=dict(b=0, l=0, r=0, t=40),
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        width=800,
-        height=800
-    )
-    
-    fig.write_html('visualizations/y02_diffusion_network.html')
+        
+        fig.write_html(f'{output_dir}/y02_diffusion_network{suffix}.html')
+        fig.write_image(f'{output_dir}/y02_diffusion_network{suffix}.png', engine='kaleido')
     
     # 3. International diffusion heatmap
-    int_df = diffusion_df[diffusion_df['diffusion_type'] == 'international']
-    
-    if not int_df.empty:
-        int_stats = int_df.groupby(['source_class', 'target_class'])['time_lag_days'].mean().reset_index()
+    for mechanism, suffix, title_suffix in [
+        (diffusion_df[(diffusion_df['diffusion_type'] == 'international') & (diffusion_df['has_citation'])], '_citation', ' (Citation-based)'),
+        (diffusion_df[(diffusion_df['diffusion_type'] == 'international') & (~diffusion_df['has_citation'])], '_semantic', ' (Semantic Similarity-based)'),
+        (diffusion_df[diffusion_df['diffusion_type'] == 'international'], '', '')
+    ]:
+        if len(mechanism) == 0:
+            continue
+            
+        output_dir = 'visualizations/combined' if not suffix else f'visualizations/{suffix[1:]}'
+        int_df = mechanism
         
-        # Create a pivot table for the heatmap
-        heatmap_data = int_stats.pivot(index='source_class', columns='target_class', values='time_lag_days') / 365.25
-        
-        # Convert to format needed for plotly
-        z_data = heatmap_data.values
-        x_data = heatmap_data.columns.tolist()
-        y_data = heatmap_data.index.tolist()
-        
-        heatmap_fig = go.Figure(data=go.Heatmap(
-            z=z_data,
-            x=x_data,
-            y=y_data,
-            colorscale='YlGnBu',
-            hoverongaps=False,
-            text=[[f"{z:.1f} years" for z in row] for row in z_data],
-            hoverinfo='text+x+y'
-        ))
-        
-        heatmap_fig.update_layout(
-            title='Average Diffusion Time (Years) from US to EP Patents by Y02 Class',
-            xaxis_title='Target Y02 Class',
-            yaxis_title='Source Y02 Class'
-        )
-        
-        heatmap_fig.write_html('visualizations/international_diffusion_heatmap.html')
+        if not int_df.empty:
+            # Create separate heatmaps for each direction
+            directions = int_df[['source_auth', 'target_auth']].drop_duplicates().values
+            
+            for source_auth, target_auth in directions:
+                dir_df = int_df[(int_df['source_auth'] == source_auth) &
+                               (int_df['target_auth'] == target_auth)]
+                
+                dir_stats = dir_df.groupby(['source_class', 'target_class'])['time_lag_days'].mean().reset_index()
+                
+                # Create a pivot table for the heatmap
+                heatmap_data = dir_stats.pivot(index='source_class', columns='target_class', values='time_lag_days') / 365.25
+                
+                # Convert to format needed for plotly
+                z_data = heatmap_data.values
+                x_data = heatmap_data.columns.tolist()
+                y_data = heatmap_data.index.tolist()
+                
+                heatmap_fig = go.Figure(data=go.Heatmap(
+                    z=z_data,
+                    x=x_data,
+                    y=y_data,
+                    colorscale='YlGnBu',
+                    hoverongaps=False,
+                    text=[[f"{z:.1f} years" for z in row] for row in z_data],
+                    hoverinfo='text+x+y'
+                ))
+                
+                heatmap_fig.update_layout(
+                    title=f'Average Diffusion Time (Years) from {source_auth} to {target_auth} Patents by Y02 Class{title_suffix}',
+                    xaxis_title='Target Y02 Class',
+                    yaxis_title='Source Y02 Class'
+                )
+                
+                # Save with direction and mechanism suffix
+                direction_suffix = f'_{source_auth}_to_{target_auth}{suffix}'
+                heatmap_fig.write_html(f'{output_dir}/international_diffusion_heatmap{direction_suffix}.html')
+                heatmap_fig.write_image(f'{output_dir}/international_diffusion_heatmap{direction_suffix}.png', engine='kaleido')
     
     # 4. Time series of diffusion over years
-    diffusion_df['year'] = pd.to_datetime(diffusion_df['target_date']).dt.year
-    time_series = diffusion_df.groupby(['year', 'diffusion_type']).size().reset_index(name='count')
-    
-    fig = go.Figure()
-    
-    for diff_type in time_series['diffusion_type'].unique():
-        data = time_series[time_series['diffusion_type'] == diff_type]
-        fig.add_trace(go.Scatter(
-            x=data['year'],
-            y=data['count'],
-            mode='lines+markers',
-            name=diff_type,
-            line=dict(width=2)
-        ))
-    
-    fig.update_layout(
-        title='TEK Diffusion Over Time by Type',
-        xaxis_title='Year',
-        yaxis_title='Number of Diffusion Events',
-        hovermode='x unified',
-        legend_title='Diffusion Type'
-    )
-    
-    fig.write_html('visualizations/diffusion_time_series.html')
+    for mechanism, suffix, title_suffix in [
+        (diffusion_df[diffusion_df['has_citation']], '_citation', ' (Citation-based)'),
+        (diffusion_df[~diffusion_df['has_citation']], '_semantic', ' (Semantic Similarity-based)'),
+        (diffusion_df, '', '')
+    ]:
+        if len(mechanism) == 0:
+            continue
+            
+        output_dir = 'visualizations/combined' if not suffix else f'visualizations/{suffix[1:]}'
+        mechanism['year'] = pd.to_datetime(mechanism['target_date']).dt.year
+        time_series = mechanism.groupby(['year', 'diffusion_type']).size().reset_index(name='count')
+        
+        fig = go.Figure()
+        
+        for diff_type in time_series['diffusion_type'].unique():
+            data = time_series[time_series['diffusion_type'] == diff_type]
+            fig.add_trace(go.Scatter(
+                x=data['year'],
+                y=data['count'],
+                mode='lines+markers',
+                name=diff_type,
+                line=dict(width=2)
+            ))
+        
+        fig.update_layout(
+            title=f'TEK Diffusion Over Time by Type{title_suffix}',
+            xaxis_title='Year',
+            yaxis_title='Number of Diffusion Events',
+            hovermode='x unified',
+            legend_title='Diffusion Type'
+        )
+        
+        fig.write_html(f'{output_dir}/diffusion_time_series{suffix}.html')
+        fig.write_image(f'{output_dir}/diffusion_time_series{suffix}.png', engine='kaleido')
     
     # 5. Add diffusion speed comparison chart
-    class_speed = diffusion_df.groupby(['source_class', 'diffusion_type'])['time_lag_days'].mean().reset_index()
-    class_speed['time_lag_years'] = class_speed['time_lag_days'] / 365.25
+    for mechanism, suffix, title_suffix in [
+        (diffusion_df[diffusion_df['has_citation']], '_citation', ' (Citation-based)'),
+        (diffusion_df[~diffusion_df['has_citation']], '_semantic', ' (Semantic Similarity-based)'),
+        (diffusion_df, '', '')
+    ]:
+        if len(mechanism) == 0:
+            continue
+            
+        output_dir = 'visualizations/combined' if not suffix else f'visualizations/{suffix[1:]}'
+        class_speed = mechanism.groupby(['source_class', 'diffusion_type'])['time_lag_days'].mean().reset_index()
+        class_speed['time_lag_years'] = class_speed['time_lag_days'] / 365.25
+        
+        speed_fig = px.bar(
+            class_speed,
+            x='source_class',
+            y='time_lag_years',
+            color='diffusion_type',
+            barmode='group',
+            title=f'Average Diffusion Speed by Y02 Class and Diffusion Type{title_suffix}',
+            labels={'time_lag_years': 'Average Diffusion Time (Years)', 'source_class': 'Y02 Class'},
+            text_auto='.1f'
+        )
+        
+        speed_fig.update_layout(
+            legend_title='Diffusion Type',
+            xaxis_tickangle=-45
+        )
+        
+        speed_fig.write_html(f'{output_dir}/diffusion_speed_comparison{suffix}.html')
+        speed_fig.write_image(f'{output_dir}/diffusion_speed_comparison{suffix}.png', engine='kaleido')
     
-    speed_fig = px.bar(
-        class_speed,
-        x='source_class',
-        y='time_lag_years',
-        color='diffusion_type',
-        barmode='group',
-        title='Average Diffusion Speed by Y02 Class and Diffusion Type',
-        labels={'time_lag_years': 'Average Diffusion Time (Years)', 'source_class': 'Y02 Class'},
-        text_auto='.1f'
-    )
-    
-    speed_fig.update_layout(
-        legend_title='Diffusion Type',
-        xaxis_tickangle=-45
-    )
-    
-    speed_fig.write_html('visualizations/diffusion_speed_comparison.html')
-    
-    # 6. Citation vs. Similarity comparison
+    # 6. Combined mechanism comparison (only in combined directory)
     diffusion_df['diffusion_mechanism'] = diffusion_df['has_citation'].map({True: 'Citation', False: 'Semantic Similarity'})
     mechanism_counts = diffusion_df.groupby(['diffusion_type', 'diffusion_mechanism']).size().reset_index(name='count')
     
     mech_fig = px.bar(
-        mechanism_counts, 
-        x='diffusion_type', 
-        y='count', 
+        mechanism_counts,
+        x='diffusion_type',
+        y='count',
         color='diffusion_mechanism',
         title='Diffusion Mechanisms by Type',
         labels={'diffusion_type': 'Diffusion Type', 'count': 'Number of Connections'},
         barmode='group'
     )
     
-    mech_fig.write_html('visualizations/diffusion_mechanisms.html')
+    mech_fig.write_html('visualizations/combined/diffusion_mechanisms.html')
+    mech_fig.write_image('visualizations/combined/diffusion_mechanisms.png', engine='kaleido')
     
-    print("Interactive HTML visualizations saved to 'visualizations' directory.")
+    print("Interactive HTML visualizations saved to 'visualizations' directory with separate citation and semantic subdirectories.")
 
 def analyze_diffusion():
     """Main function to analyze diffusion patterns using pre-computed embeddings with multiprocessing."""
@@ -892,20 +1027,20 @@ def analyze_diffusion():
     print(f"Running on a machine with {num_cores} CPU cores")
     
     # Check if required files exist
-    if not os.path.exists(f'/home/thiesen/Documents/Projekt_EDV-TEK/AP 3 - Diffusion von TEKs/edv_tek_cleantech_patstat_diffusion_preprocessed_{MIN_YEAR}_{MAX_YEAR}.parquet'):
+    if not os.path.exists(f'/fibus/fs1/0f/cyh1826/wt/edv_tek/edv_tek_cleantech_patstat_diffusion_preprocessed_{MIN_YEAR}_{MAX_YEAR}.parquet'):
         print(f"Error: preprocessed data file not found.")
         print("Please run generate_embeddings.py first.")
         return
     
-    if not os.path.exists(f'/home/thiesen/Documents/Projekt_EDV-TEK/AP 3 - Diffusion von TEKs/edv_tek_cleantech_patstat_diffusion_embeddings_{MIN_YEAR}_{MAX_YEAR}.npy'):
+    if not os.path.exists(f'/fibus/fs1/0f/cyh1826/wt/edv_tek/edv_tek_cleantech_patstat_diffusion_embeddings_{MIN_YEAR}_{MAX_YEAR}.npy'):
         print("Error: embeddings file not found.")
         print("Please run generate_embeddings.py first.")
         return
     
     # Load preprocessed data and embeddings
     print("Loading preprocessed data and embeddings...")
-    base_df = pd.read_parquet(f'/home/thiesen/Documents/Projekt_EDV-TEK/AP 3 - Diffusion von TEKs/edv_tek_cleantech_patstat_diffusion_preprocessed_{MIN_YEAR}_{MAX_YEAR}.parquet')
-    embeddings = np.load(f'/home/thiesen/Documents/Projekt_EDV-TEK/AP 3 - Diffusion von TEKs/edv_tek_cleantech_patstat_diffusion_embeddings_{MIN_YEAR}_{MAX_YEAR}.npy')
+    base_df = pd.read_parquet(f'/fibus/fs1/0f/cyh1826/wt/edv_tek/edv_tek_cleantech_patstat_diffusion_preprocessed_{MIN_YEAR}_{MAX_YEAR}.parquet')
+    embeddings = np.load(f'/fibus/fs1/0f/cyh1826/wt/edv_tek/edv_tek_cleantech_patstat_diffusion_embeddings_{MIN_YEAR}_{MAX_YEAR}.npy')
     
     # Verify alignment
     print(f"Base dataframe size: {len(base_df)}, Embeddings size: {len(embeddings)}")

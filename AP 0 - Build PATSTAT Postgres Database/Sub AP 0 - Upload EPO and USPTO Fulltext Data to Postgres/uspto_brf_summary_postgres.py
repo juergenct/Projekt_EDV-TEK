@@ -6,12 +6,12 @@ from tqdm import tqdm
 
 # Database connection details
 url_object = URL.create(
-    drivername="postgresql+psycopg2",
-    username="user",
-    password="password",
-    host="localhost",
-    port="25432",
-    database="database",
+    drivername="",
+    username="",
+    password="",
+    host="",
+    port="",
+    database=""
 )
 engine = create_engine(url_object)  #, echo=True)
 

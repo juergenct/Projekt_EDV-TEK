@@ -12,7 +12,7 @@ url_object = URL.create(
     password="",
     host="",
     port="",
-    database="",
+    database=""
 )
 engine = create_engine(url_object) #, echo=True)
 directory = '/mnt/hdd01/EP_Fulltext_Data'

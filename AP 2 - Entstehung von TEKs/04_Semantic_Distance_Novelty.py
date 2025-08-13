@@ -10,6 +10,9 @@ from functools import partial
 import os
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import mmap
+import gc
+from multiprocessing import shared_memory
 
 
 def compute_cosine_distance(vec1, vec2):
@@ -50,52 +53,67 @@ def compute_novelty_score(cited_papers_embeddings, q=100):
         return np.percentile(distances, q)
 
 
-def process_patent_batch(patents_batch, paper_id_to_embedding, min_cited_papers, q_values):
+def process_patent_batch_with_h5(patents_batch_data, h5_file_path, patent_idx_to_appln_id, min_cited_papers, q_values):
     """
-    Process a batch of patents and compute their novelty scores
+    Process a batch of patents and compute their novelty scores using direct H5 access
     
     Args:
-        patents_batch: List of (patent_id, cited_papers) tuples
-        paper_id_to_embedding: Dictionary mapping from paper index to embedding
+        patents_batch_data: List of (patent_id, cited_papers) tuples
+        h5_file_path: Path to the H5 file for direct embedding access
+        patent_idx_to_appln_id: Dictionary mapping from patent index to appln_id
         min_cited_papers: Minimum number of papers a patent must cite to be included
         q_values: List of percentile values for novelty computation
         
     Returns:
-        List of dictionaries with patent_id and novelty scores
+        List of dictionaries with patent_id, appln_id and novelty scores
     """
     results = []
-
-    # Process each patent in the batch
-    for patent_id, cited_papers in patents_batch:
-        if len(cited_papers) < min_cited_papers:
-            continue
-            
-        # Get embeddings for cited papers
-        try:
-            cited_papers_embeddings = [paper_id_to_embedding[paper_id] for paper_id in cited_papers]
-            
-            # Compute novelty score for each q value
-            row = {'patent_id': patent_id}
-            for q in q_values:
-                score = compute_novelty_score(cited_papers_embeddings, q)
-                row[f'novelty_q{q}'] = score
-            
-            results.append(row)
-        except KeyError as e:
-            # Skip patents with missing embeddings and log the issue
-            print(f"Warning: Skipping patent {patent_id} due to missing embedding for paper {e}")
-            continue
-        except Exception as e:
-            print(f"Error processing patent {patent_id}: {str(e)}")
-            continue
+    
+    # Open H5 file for this worker process
+    with h5py.File(h5_file_path, 'r') as f:
+        paper_embeddings = f['paper_embeddings']
         
+        # Process each patent in the batch
+        for patent_id, cited_papers in patents_batch_data:
+            if len(cited_papers) < min_cited_papers:
+                continue
+                
+            # Get embeddings for cited papers directly from H5
+            try:
+                cited_papers_embeddings = []
+                for paper_id in cited_papers:
+                    if paper_id < len(paper_embeddings):
+                        cited_papers_embeddings.append(paper_embeddings[paper_id])
+                    else:
+                        raise KeyError(f"Paper ID {paper_id} out of range")
+                
+                # Get appln_id for this patent
+                appln_id = patent_idx_to_appln_id.get(patent_id, None)
+                if appln_id is None:
+                    continue
+                
+                # Compute novelty score for each q value
+                row = {'patent_id': patent_id, 'appln_id': appln_id}
+                for q in q_values:
+                    score = compute_novelty_score(cited_papers_embeddings, q)
+                    row[f'novelty_q{q}'] = score
+                
+                results.append(row)
+                
+            except (KeyError, IndexError) as e:
+                # Skip patents with missing embeddings
+                continue
+            except Exception as e:
+                continue
+            
     return results
 
 
-def compute_patent_novelty(h5_file_path, min_cited_papers=3, q_values=None, n_cores=32, batch_size=50, 
+def compute_patent_novelty(h5_file_path, min_cited_papers=3, q_values=None, n_cores=32, batch_size=50,
                     checkpoint_file=None, checkpoint_interval=10):
     """
     Compute novelty scores for patents based on semantic distances between cited papers.
+    Memory-optimized version using direct H5 access in worker processes.
     
     Args:
         h5_file_path: Path to the HDF5 file containing patents and papers data
@@ -112,23 +130,36 @@ def compute_patent_novelty(h5_file_path, min_cited_papers=3, q_values=None, n_co
     if q_values is None:
         q_values = [100, 99, 95, 90, 80, 50]
     
-    print(f"Loading data from {h5_file_path}...")
+    print(f"Loading metadata from {h5_file_path}...")
+    
+    # Only load metadata and citation relationships - not the full embeddings
     with h5py.File(h5_file_path, 'r') as f:
-        # Load paper embeddings
-        print("Loading paper embeddings...")
-        paper_embeddings = f['paper_embeddings'][:]
-        print(f"Loaded {len(paper_embeddings)} paper embeddings")
-        
         # Load patent-paper citations
         print("Loading patent-paper citations...")
         patent_paper_citations = f['patent_paper_citations'][:]
         print(f"Loaded {len(patent_paper_citations)} patent-paper citation pairs")
+        
+        # Load patent metadata for appln_id mapping
+        print("Loading patent metadata...")
+        patent_appln_ids = f['patent_appln_id'][:]
+        # Convert bytes to strings if necessary
+        if isinstance(patent_appln_ids[0], bytes):
+            patent_appln_ids = [app_id.decode('utf-8') for app_id in patent_appln_ids]
+        print(f"Loaded {len(patent_appln_ids)} patent application IDs")
+        
+        # Get embedding count without loading all embeddings
+        n_embeddings = f['paper_embeddings'].shape[0]
+        print(f"Found {n_embeddings} paper embeddings (not loaded into memory)")
     
-    # Create dictionary mapping from paper index to embedding
-    print("Processing paper embeddings...")
-    paper_id_to_embedding = {}
-    for i, embedding in enumerate(tqdm(paper_embeddings, desc="Creating embedding lookup")):
-        paper_id_to_embedding[i] = embedding
+    # Create mapping from patent index to appln_id
+    print("Creating patent index to appln_id mapping...")
+    patent_idx_to_appln_id = {}
+    for i, appln_id in enumerate(patent_appln_ids):
+        patent_idx_to_appln_id[i] = appln_id
+    
+    # Free memory
+    del patent_appln_ids
+    gc.collect()
     
     # Create dictionary grouping cited papers by patent
     print("Grouping cited papers by patent...")
@@ -138,6 +169,10 @@ def compute_patent_novelty(h5_file_path, min_cited_papers=3, q_values=None, n_co
             patent_to_cited_papers[patent_id] = []
         patent_to_cited_papers[patent_id].append(paper_id)
     
+    # Free memory
+    del patent_paper_citations
+    gc.collect()
+    
     # Filter patents with fewer than min_cited_papers cited papers
     print(f"Filtering patents with at least {min_cited_papers} cited papers...")
     patents_with_enough_citations = {}
@@ -145,13 +180,20 @@ def compute_patent_novelty(h5_file_path, min_cited_papers=3, q_values=None, n_co
         if len(cited_papers) >= min_cited_papers:
             patents_with_enough_citations[patent_id] = cited_papers
     
+    # Free memory
+    del patent_to_cited_papers
+    gc.collect()
+    
     # Convert dictionary to list of tuples for easier batching
     patents_list = list(patents_with_enough_citations.items())
+    del patents_with_enough_citations
+    gc.collect()
     
-    # Create a partial function with fixed arguments
+    # Create a partial function with fixed arguments - no large data structures passed
     process_func = partial(
-        process_patent_batch, 
-        paper_id_to_embedding=paper_id_to_embedding,
+        process_patent_batch_with_h5,
+        h5_file_path=h5_file_path,
+        patent_idx_to_appln_id=patent_idx_to_appln_id,
         min_cited_papers=min_cited_papers,
         q_values=q_values
     )
@@ -163,17 +205,21 @@ def compute_patent_novelty(h5_file_path, min_cited_papers=3, q_values=None, n_co
         if batch:  # Ensure no empty batches
             patent_batches.append(batch)
     
-    print(f"Computing novelty scores for {len(patents_with_enough_citations)} patents using {n_cores} cores...")
+    # Free memory
+    del patents_list
+    gc.collect()
+    
+    print(f"Computing novelty scores using {n_cores} cores...")
     print(f"Processing {len(patent_batches)} batches with ~{batch_size} patents per batch")
     
     # Check if we should resume from a checkpoint
     all_results = []
-    start_batch = 0
     
     if checkpoint_file and os.path.exists(checkpoint_file):
         try:
             checkpoint_df = pd.read_csv(checkpoint_file)
             all_results = checkpoint_df.to_dict('records')
+            # Use patent_id for tracking processed patents (internal index)
             processed_patents = set(checkpoint_df['patent_id'].values)
             
             # Filter out already processed patents
@@ -192,14 +238,14 @@ def compute_patent_novelty(h5_file_path, min_cited_papers=3, q_values=None, n_co
             print(f"Error loading checkpoint: {str(e)}")
             print("Starting from scratch")
     
-    # Process the batches in parallel
+    # Process the batches in parallel with memory-conscious approach
     with multiprocessing.Pool(processes=n_cores) as pool:
         # Use imap_unordered for potentially better performance
         batch_results_iter = pool.imap_unordered(process_func, patent_batches)
         
         # Set up progress bar
         pbar = tqdm(
-            total=len(patent_batches), 
+            total=len(patent_batches),
             desc="Processing patent batches",
             unit="batch"
         )
@@ -320,7 +366,7 @@ def main():
         )
         
         # Save to CSV
-        novelty_df.to_csv(args.patent_novelty_scores.csv, index=False)
+        novelty_df.to_csv(args.output, index=False)
         print(f"Novelty scores saved to {args.output}")
         
         # Plot distributions

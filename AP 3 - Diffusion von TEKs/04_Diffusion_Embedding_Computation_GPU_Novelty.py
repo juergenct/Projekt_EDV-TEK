@@ -77,28 +77,73 @@ def generate_embeddings(include_novelty_data=True):
             novelty_df = pd.read_csv('edv_tek_diffusion_patent_novelty_scores.csv')
             print(f"Loaded novelty data for {len(novelty_df)} patents")
             
-            # Merge novelty scores with base dataset
-            print("Merging novelty scores with patent data...")
+            # Convert both appln_id columns to string for consistent merging
+            print(f"Before conversion - Base df appln_id dtype: {base_df['appln_id'].dtype}")
+            print(f"Before conversion - Novelty df appln_id dtype: {novelty_df['appln_id'].dtype}")
+            
+            # Convert both to string to ensure consistent data types
+            base_df['appln_id'] = base_df['appln_id'].astype(str)
+            novelty_df['appln_id'] = novelty_df['appln_id'].astype(str)
+            
+            print(f"After conversion - Base df appln_id dtype: {base_df['appln_id'].dtype}")
+            print(f"After conversion - Novelty df appln_id dtype: {novelty_df['appln_id'].dtype}")
+            
+            # Check for overlapping IDs before merge
+            base_ids = set(base_df['appln_id'])
+            novelty_ids = set(novelty_df['appln_id'])
+            overlap = base_ids.intersection(novelty_ids)
+            print(f"Base df unique IDs: {len(base_ids)}")
+            print(f"Novelty df unique IDs: {len(novelty_ids)}")
+            print(f"Number of overlapping IDs: {len(overlap)}")
+            if len(overlap) > 0:
+                print(f"Sample overlapping IDs: {list(overlap)[:10]}")
+            else:
+                print("WARNING: No overlapping application IDs found between datasets!")
+            
+            # Only keep patents that have novelty scores - use inner join instead of left join
+            print("Filtering to only patents with novelty scores...")
+            print(f"Patents before filtering: {len(base_df)}")
             base_df = pd.merge(
                 base_df, 
-                novelty_df[['patent_id', 'novelty_q100', 'novelty_q90', 'novelty_q50']], 
+                novelty_df[['appln_id', 'novelty_q100', 'novelty_q90', 'novelty_q50']], 
                 left_on='appln_id', 
-                right_on='patent_id', 
-                how='left'
+                right_on='appln_id', 
+                how='inner'  # Only keep patents that exist in both datasets
             )
+            print(f"Patents after filtering (with novelty scores): {len(base_df)}")
             
-            # Calculate novelty percentiles
+            # Since we used inner join, all patents should have novelty scores
             print("Calculating novelty percentiles...")
+            print(f"Total patents (all should have novelty scores): {len(base_df)}")
+            print(f"Patents with novelty scores: {base_df['novelty_q100'].notna().sum()}")
+            print(f"Patents without novelty scores: {base_df['novelty_q100'].isna().sum()}")
+            
+            # Check if we have any patents after filtering
+            if len(base_df) == 0:
+                print("ERROR: No patents remaining after filtering for novelty scores!")
+                print("This means no patents in the diffusion dataset match the novelty scores dataset.")
+                return
+            
+            # Calculate percentiles among all patents (since all should have novelty scores now)
             novelty_cols = [col for col in base_df.columns if col.startswith('novelty_q')]
             for col in novelty_cols:
-                base_df[f'{col}_percentile'] = base_df[col].rank(pct=True) * 100
+                base_df[f'{col}_percentile'] = base_df[col].rank(pct=True, method='average') * 100
             
-            # Classify patents into novelty categories
-            base_df['novelty_category'] = 'Medium'
+            # Classify patents into novelty categories based on percentiles
+            base_df['novelty_category'] = 'Medium'  # Default
             base_df.loc[base_df['novelty_q100_percentile'] >= 90, 'novelty_category'] = 'High'
             base_df.loc[base_df['novelty_q100_percentile'] <= 10, 'novelty_category'] = 'Low'
             
             print(f"Novelty categories: {base_df['novelty_category'].value_counts().to_dict()}")
+            
+            # Additional debugging information
+            print(f"Novelty score statistics:")
+            print(f"  Min percentile: {base_df['novelty_q100_percentile'].min():.2f}")
+            print(f"  Max percentile: {base_df['novelty_q100_percentile'].max():.2f}")
+            print(f"  Mean percentile: {base_df['novelty_q100_percentile'].mean():.2f}")
+            print(f"  Patents >= 90th percentile (High): {(base_df['novelty_q100_percentile'] >= 90).sum()}")
+            print(f"  Patents <= 10th percentile (Low): {(base_df['novelty_q100_percentile'] <= 10).sum()}")
+            print(f"  Patents 11-89th percentile (Medium): {((base_df['novelty_q100_percentile'] > 10) & (base_df['novelty_q100_percentile'] < 90)).sum()}")
         except Exception as e:
             print(f"Warning: Could not load or process novelty scores: {str(e)}")
             print("Continuing without novelty data")
